@@ -1,0 +1,85 @@
+
+name: Sync Shouko and Build APK
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 5 * * *' # Daily, UTC
+
+permissions:
+  contents: write
+
+concurrency:
+  group: shouko-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync-and-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Fetch and merge upstream
+        id: sync
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream \
+            https://github.com/ivaniskandar/shouko.git
+
+          git fetch upstream master
+
+          BEFORE=$(git rev-parse HEAD)
+
+          git merge --no-edit upstream/master
+
+          AFTER=$(git rev-parse HEAD)
+
+          if [ "$BEFORE" != "$AFTER" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git push origin HEAD:master
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Java 21
+        if: steps.sync.outputs.changed == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Configure Gradle
+        if: steps.sync.outputs.changed == 'true'
+        run: |
+          mkdir -p ~/.gradle
+          cp .github/ci-gradle.properties \
+            ~/.gradle/gradle.properties
+
+      - name: Set up Gradle
+        if: steps.sync.outputs.changed == 'true'
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build APK
+        if: steps.sync.outputs.changed == 'true'
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - name: Upload APK
+        if: steps.sync.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: shouko-upstream-${{ github.run_number }}
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 90
+          if-no-files-found: error
