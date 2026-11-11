@@ -1,25 +1,26 @@
-
-name: Sync Shouko and Build APK
+name: Sync Shouko and Publish APK
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '17 5 * * *' # Daily, UTC
+    - cron: '17 5 * * *' # Daily at 05:17 UTC
 
 permissions:
   contents: write
 
 concurrency:
-  group: shouko-upstream-sync
+  group: shouko-upstream-release
   cancel-in-progress: false
 
 jobs:
-  sync-and-build:
+  sync-build-release:
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
 
     steps:
       - name: Checkout fork
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: master
           fetch-depth: 0
@@ -29,57 +30,245 @@ jobs:
         id: sync
         shell: bash
         run: |
+          set -euo pipefail
+
           git config user.name "github-actions[bot]"
           git config user.email \
             "41898282+github-actions[bot]@users.noreply.github.com"
 
           git remote add upstream \
-            https://github.com/ivaniskandar/shouko.git
+            https://github.com/ivaniskandar/shouko.git 2>/dev/null || \
+            git remote set-url upstream \
+              https://github.com/ivaniskandar/shouko.git
+          git fetch --no-tags upstream master
 
-          git fetch upstream master
-
-          BEFORE=$(git rev-parse HEAD)
-
+          before=$(git rev-parse HEAD)
+          upstream_sha=$(git rev-parse upstream/master)
           git merge --no-edit upstream/master
+          after=$(git rev-parse HEAD)
 
-          AFTER=$(git rev-parse HEAD)
-
-          if [ "$BEFORE" != "$AFTER" ]; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
+          if [[ "$before" != "$after" ]]; then
             git push origin HEAD:master
+            echo "changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
           fi
 
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether a release is needed
+        id: release
+        shell: bash
+        env:
+          UPSTREAM_SHA: ${{ steps.sync.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+
+          latest_json=$(gh api \
+            "/repos/$GITHUB_REPOSITORY/releases/latest" 2>/dev/null || true)
+          latest_body=$(jq -r '.body // ""' <<< "$latest_json" 2>/dev/null || true)
+          released_sha=$(sed -nE \
+            's/.*<!-- upstream-sha: ([0-9a-f]{40}) -->.*/\1/p' \
+            <<< "$latest_body" | head -n 1)
+          has_apk=$(jq -r \
+            '[.assets[]?.name | endswith(".apk")] | any' \
+            <<< "$latest_json" 2>/dev/null || echo false)
+
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" || \
+                "$released_sha" != "$UPSTREAM_SHA" || \
+                "$has_apk" != "true" ]]; then
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "previous_upstream_sha=$released_sha" >> "$GITHUB_OUTPUT"
+
       - name: Set up Java 21
-        if: steps.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
-        uses: actions/setup-java@v4
+        if: steps.release.outputs.needed == 'true'
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '21'
 
       - name: Configure Gradle
-        if: steps.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        if: steps.release.outputs.needed == 'true'
+        shell: bash
         run: |
           mkdir -p ~/.gradle
-          cp .github/ci-gradle.properties \
-            ~/.gradle/gradle.properties
+          cp .github/ci-gradle.properties ~/.gradle/gradle.properties
 
       - name: Set up Gradle
-        if: steps.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
-        uses: gradle/actions/setup-gradle@v4
+        if: steps.release.outputs.needed == 'true'
+        uses: gradle/actions/setup-gradle@v6
 
-      - name: Build APK
-        if: steps.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+      - name: Configure persistent signing
+        if: steps.release.outputs.needed == 'true'
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          ALIAS: ${{ secrets.ALIAS }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          chmod +x gradlew
-          ./gradlew assembleDebug
+          set -euo pipefail
 
-      - name: Upload APK
-        if: steps.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
+          : "${SIGNING_KEY:?SIGNING_KEY secret is required}"
+          : "${ALIAS:?ALIAS secret is required}"
+          : "${KEY_STORE_PASSWORD:?KEY_STORE_PASSWORD secret is required}"
+          : "${KEY_PASSWORD:?KEY_PASSWORD secret is required}"
+
+          keystore="$RUNNER_TEMP/shouko-release.jks"
+          printf '%s' "$SIGNING_KEY" | base64 --decode > "$keystore"
+
+          {
+            printf 'storeFile=%s\n' "$keystore"
+            printf 'storePassword=%s\n' "$KEY_STORE_PASSWORD"
+            printf 'keyAlias=%s\n' "$ALIAS"
+            printf 'keyPassword=%s\n' "$KEY_PASSWORD"
+          } > keystore.properties
+
+          keytool -list \
+            -keystore "$keystore" \
+            -storepass "$KEY_STORE_PASSWORD" \
+            -alias "$ALIAS" >/dev/null
+
+      - name: Set release metadata
+        if: steps.release.outputs.needed == 'true'
+        id: metadata
+        shell: bash
+        env:
+          UPSTREAM_SHA: ${{ steps.sync.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+
+          version_code=$(( $(date -u +%s) - 1577836800 ))
+          timestamp=$(date -u +%Y.%m.%d-%H%M%S)
+          upstream_short=${UPSTREAM_SHA:0:7}
+          tag="build-${timestamp}-r${GITHUB_RUN_NUMBER}-${upstream_short}"
+
+          base_version=$(sed -nE \
+            's/^[[:space:]]*versionName = "([^"]+)"/\1/p' \
+            app/build.gradle | head -n 1)
+          [[ -n "$base_version" ]]
+          [[ $(grep -cE '^[[:space:]]*versionCode = [0-9]+' \
+            app/build.gradle) -eq 1 ]]
+
+          sed -i -E \
+            "s/^([[:space:]]*)versionCode = [0-9]+/\1versionCode = $version_code/" \
+            app/build.gradle
+          sed -i -E \
+            "s/^([[:space:]]*)versionName = \"[^\"]+\"/\1versionName = \"${base_version}-${timestamp}-r${GITHUB_RUN_NUMBER}\"/" \
+            app/build.gradle
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version_code=$version_code" >> "$GITHUB_OUTPUT"
+          echo "base_version=$base_version" >> "$GITHUB_OUTPUT"
+
+      - name: Build signed release APK
+        if: steps.release.outputs.needed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew spotlessCheck assembleRelease --stacktrace
+
+      - name: Verify and rename APK
+        if: steps.release.outputs.needed == 'true'
+        id: apk
+        shell: bash
+        env:
+          TAG: ${{ steps.metadata.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          source_apk="app/build/outputs/apk/release/app-release.apk"
+          [[ -f "$source_apk" ]]
+          output_apk="xperia-shouko-${TAG}.apk"
+          cp "$source_apk" "$output_apk"
+
+          apksigner=$(find "$ANDROID_HOME/build-tools" -type f \
+            -name apksigner | sort -V | tail -n 1)
+          [[ -n "$apksigner" ]]
+          "$apksigner" verify --verbose --print-certs "$output_apk"
+          sha256sum "$output_apk" > "${output_apk}.sha256"
+
+          echo "path=$output_apk" >> "$GITHUB_OUTPUT"
+          echo "sha256_path=${output_apk}.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Create upstream changelog
+        if: steps.release.outputs.needed == 'true'
+        id: changelog
+        shell: bash
+        env:
+          CURRENT_SHA: ${{ steps.sync.outputs.upstream_sha }}
+          PREVIOUS_SHA: ${{ steps.release.outputs.previous_upstream_sha }}
+          TAG: ${{ steps.metadata.outputs.tag }}
+          APK_PATH: ${{ steps.apk.outputs.path }}
+        run: |
+          set -euo pipefail
+
+          notes="$RUNNER_TEMP/release-notes.md"
+          {
+            echo "Automated signed build of [ivaniskandar/shouko](https://github.com/ivaniskandar/shouko)."
+            echo
+            echo "- Upstream commit: [\`${CURRENT_SHA:0:7}\`](https://github.com/ivaniskandar/shouko/commit/$CURRENT_SHA)"
+            echo "- Android version code: \`${{ steps.metadata.outputs.version_code }}\`"
+            echo "- APK: \`$APK_PATH\`"
+            echo
+            echo "## Upstream changes"
+            echo
+
+            if [[ "$PREVIOUS_SHA" =~ ^[0-9a-f]{40}$ ]] && \
+               git merge-base --is-ancestor "$PREVIOUS_SHA" upstream/master; then
+              commit_count=$(git rev-list --count \
+                "$PREVIOUS_SHA..upstream/master")
+              if [[ "$commit_count" -eq 0 ]]; then
+                echo "Manual rebuild of the same upstream commit."
+              else
+                echo "[Compare upstream commits](https://github.com/ivaniskandar/shouko/compare/${PREVIOUS_SHA}...${CURRENT_SHA})"
+                echo
+                git log --reverse \
+                  --pretty=format:'- %s ([`%h`](https://github.com/ivaniskandar/shouko/commit/%H))' \
+                  "$PREVIOUS_SHA..upstream/master"
+                echo
+              fi
+            else
+              echo "Initial automated release from the current upstream snapshot."
+            fi
+
+            echo
+            echo "<!-- upstream-sha: $CURRENT_SHA -->"
+          } > "$notes"
+
+          echo "path=$notes" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK artifact
+        if: steps.release.outputs.needed == 'true'
+        uses: actions/upload-artifact@v7
         with:
-          name: shouko-upstream-${{ github.run_number }}
-          path: app/build/outputs/apk/debug/*.apk
+          name: xperia-shouko-${{ steps.metadata.outputs.tag }}
+          path: |
+            ${{ steps.apk.outputs.path }}
+            ${{ steps.apk.outputs.sha256_path }}
           retention-days: 90
           if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: steps.release.outputs.needed == 'true'
+        shell: bash
+        env:
+          TAG: ${{ steps.metadata.outputs.tag }}
+          APK_PATH: ${{ steps.apk.outputs.path }}
+          SHA256_PATH: ${{ steps.apk.outputs.sha256_path }}
+          NOTES_PATH: ${{ steps.changelog.outputs.path }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            "$APK_PATH" \
+            "$SHA256_PATH" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target master \
+            --title "Shouko ${TAG}" \
+            --notes-file "$NOTES_PATH" \
+            --latest
