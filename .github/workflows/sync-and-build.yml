@@ -52,31 +52,31 @@ jobs:
           fi
 
       - name: Set up Java 21
-        if: steps.sync.outputs.changed == 'true'
+        if: steps.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
 
       - name: Configure Gradle
-        if: steps.sync.outputs.changed == 'true'
+        if: steps.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
         run: |
           mkdir -p ~/.gradle
           cp .github/ci-gradle.properties \
             ~/.gradle/gradle.properties
 
       - name: Set up Gradle
-        if: steps.sync.outputs.changed == 'true'
+        if: steps.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
         uses: gradle/actions/setup-gradle@v4
 
       - name: Build APK
-        if: steps.sync.outputs.changed == 'true'
+        if: steps.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
         run: |
           chmod +x gradlew
           ./gradlew assembleDebug
 
       - name: Upload APK
-        if: steps.sync.outputs.changed == 'true'
+        if: steps.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: shouko-upstream-${{ github.run_number }}
