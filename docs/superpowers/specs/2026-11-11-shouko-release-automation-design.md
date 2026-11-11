@@ -23,7 +23,7 @@ Maintain a personal, installable Shouko build that follows `ivaniskandar/shouko`
 
 Use one scheduled/manual workflow. It merges upstream, compares the current upstream SHA with an `upstream-sha` marker in the latest release, configures the existing Gradle signing support from four GitHub Secrets, builds and verifies a release APK, then publishes it with `gh release create`. This avoids the extra token and coordination required by split sync/build workflows.
 
-The Android `versionCode` is seconds since 2020-01-01, keeping it monotonic and below Android's signed 32-bit ceiling for decades. Tags use `build-YYYY.MM.DD-HHMMSS-r<run>-<upstream-sha>` to stay human-readable and collision-resistant.
+The Android `versionCode` is seconds since 2020-01-01, keeping it monotonic and below Android's signed 32-bit ceiling for decades. The GitHub tag and Android `versionName` use the identical value `<base-version>-YYYY.MM.DD-HHMMSS-r<run>-<upstream-sha>` so Obtainium does not report false updates; the value remains human-readable and collision-resistant.
 
 ## Constraints and failure behavior
 
